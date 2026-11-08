@@ -1,0 +1,12 @@
+# 本地配置与凭据：含 Cookie，绝不能提交
+quarkbc.json
+quarkbc.json.bak
+
+# 运行时产物
+qrcode_login.png
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+venv/
