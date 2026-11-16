@@ -7,6 +7,7 @@
 """
 import asyncio
 import base64
+import json
 import sys
 import tempfile
 import threading
@@ -103,7 +104,7 @@ async def main() -> int:
         if not cond:
             failures.append(name)
 
-    config = {"cookie": "fake_cookie=1"}
+    config = {"cookie": "fake_cookie=1", "conns": 64}
     # 真实配置必须一个字节都不动：上一版测试传 config_path=None，扫码链路落盘时
     # 直接写进了用户的 quarkbc.json，把真 Cookie 覆盖成假值（线上事故）
     real_cfg = quarkbc.CONFIG_PATH
@@ -242,7 +243,13 @@ async def main() -> int:
             with urllib.request.urlopen(base, timeout=15) as r:
                 page = r.read().decode()
             check("mobile.index_page", "movie.mkv" in page and relay.prefix + "/d/" in page)
+            check("mobile.conns_from_config", relay.conns == 64, str(relay.conns))
+            check("mobile.page_shows_conns", "条连接并行" in page)
             tok = relay.registry.ordered()[0][0]
+            with urllib.request.urlopen(base + "s/" + tok, timeout=15) as r:
+                st = json.loads(r.read())
+            check("mobile.stats_api",
+                  st.get("size") == len(up.blob) and "speed_h" in st, str(st)[:100])
             with urllib.request.urlopen(base + "d/" + tok, timeout=15) as r:
                 body = r.read()
             check("mobile.phone_can_download", body == up.blob,

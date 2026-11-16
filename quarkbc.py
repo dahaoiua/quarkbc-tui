@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import html
+import http.client
 import json
 import os
 import random
@@ -49,6 +50,9 @@ CONFIG_PATH = Path(__file__).with_name("quarkbc.json")
 
 DEFAULT_CONFIG = {
     "cookie": "",
+    # 手机下载的外发并发连接数。和 RELAY_CONNS 保持同值（selftest 有守卫），
+    # 夸克按单连接限速，这个数基本就等于下载速度的倍数。
+    "conns": 200,
 }
 
 # ---------------------------------------------------------------- 纯逻辑（可单测）
@@ -122,6 +126,12 @@ def size_format(n) -> str:
 RELAY_PORT = 8765
 RELAY_BIND = "0.0.0.0"      # 必须监听所有网卡，手机才连得进来；测试里会改回 127.0.0.1
 RELAY_CHUNK = 256 * 1024
+
+# 并发取流参数。夸克对单连接限速约 1.2MB/s，对同一文件的并发 Range 不共享额度，
+# 所以连接数直接决定速度（比特彗星默认就是 200，原理一样）。
+RELAY_CONNS = 200           # 默认并发连接数，可在设置里改
+RELAY_UNIT = 1024 * 1024    # 每个工作单元 1MiB：小则请求开销占比高，大则首字节延迟高
+RELAY_AHEAD = 2             # 预取窗口 = 并发数 × 该系数；内存上限 ≈ 窗口 × 单元大小
 
 
 def relay_key(n: int = 9) -> str:
@@ -220,6 +230,215 @@ class RelayRegistry:
         return list(self.items.items())
 
 
+# ---------------------------------------------------------------- 并行取流
+#
+# 为什么要在电脑这边并行：夸克对**单条**连接限速（实测约 1.2MB/s），但对同一
+# 文件的多条并发 Range 请求不共享这份额度——所以比特彗星把连接数开到几百就能
+# 跑满带宽。手机浏览器只会开一条连接，如果中继也只向上游开一条，手机拿到的就
+# 永远只有 1.2MB/s。因此并行必须在中继内部做：起 N 个 worker 各持一条长连接、
+# 从共享队列领 1MiB 单元并行拉，再按顺序拼成一条流吐给手机。
+
+
+def conns_for(total: int, base: int, partial: bool = False) -> int:
+    """按文件大小和请求形态，决定这次实际开多少条上游连接。
+
+    小文件开满并发是负优化：200 条建连本身就要 2~3 秒，比文件本身还慢。
+    所以按「每 512KB 配一条」封顶，几 MB 的文件自然降到十几条。
+    """
+    base = max(1, int(base))
+    n = max(2, base // 4) if partial else base
+    if total > 0:
+        n = min(n, max(1, int(total // (512 * 1024))))
+    return max(1, n)
+
+
+def pick_unit(conns: int, budget: int = 64 * 1024 * 1024) -> int:
+    """按并发数选单元大小，把「在飞字节」压在 budget 以内。
+
+    并发 200 时如果仍用 1MiB 单元，预取窗口就是 200MB+ 内存——一个下载没跑完
+    先把机器吃穿了。所以并发越高单元越小，总预取量恒定在 64MB 左右。
+    """
+    conns = max(1, int(conns))
+    unit = RELAY_UNIT
+    while unit > 128 * 1024 and int(conns * 1.25) * unit > budget:
+        unit //= 2
+    return unit
+
+
+class _RangeUnsupported(Exception):
+    """上游不认 Range（对 Range 请求回了 200 整个文件）。这种源只能单流。"""
+
+
+class _Upstream:
+    """一个 worker 的专属长连接，连拉多个单元时复用，省掉每单元一次 TLS 握手。
+
+    1MiB 单元 @1.2MB/s 大约 0.8s，握手按 0.15s 算就是 15% 的白白损耗——所以
+    连接复用不是优化，是必需品。
+    """
+
+    def __init__(self, url: str, headers: dict, timeout: float = 30):
+        self.url = url
+        self.headers = dict(headers)
+        self.timeout = timeout
+        self._conn = None
+        self._path = ""
+
+    def _open(self, url: str) -> None:
+        u = urllib.parse.urlsplit(url)
+        host = u.hostname or ""
+        port = u.port or (443 if u.scheme == "https" else 80)
+        self._path = urllib.parse.urlunsplit(("", "", u.path or "/", u.query, ""))
+        cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        self._conn = cls(host, port, timeout=self.timeout)
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def get(self, start: int, end: int) -> bytes:
+        """取闭区间 [start, end]，必须完整拿到 end-start+1 个字节，少一个都算失败
+        （少字节会被当成「文件提前结束」，手机侧文件就是坏的）。"""
+        want = end - start + 1
+        url = self.url
+        for _ in range(4):
+            if self._conn is None:
+                self._open(url)
+            h = dict(self.headers)
+            h["Range"] = f"bytes={start}-{end}"
+            self._conn.request("GET", self._path, headers=h)
+            resp = self._conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location") or ""
+                resp.read()
+                self.close()
+                if not loc:
+                    raise OSError("上游重定向缺少 Location")
+                url = urllib.parse.urljoin(url, loc)
+                continue
+            if resp.status != 206:
+                resp.read()
+                if resp.status == 200:
+                    raise _RangeUnsupported("上游不支持 Range")
+                raise OSError(f"上游 HTTP {resp.status}")
+            buf = bytearray()
+            while len(buf) < want:
+                chunk = resp.read(min(RELAY_CHUNK, want - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+            if len(buf) < want:
+                self.close()      # 断流后这条连接不可信，下次重连
+                raise OSError(f"上游提前断流：{len(buf)}/{want}")
+            return bytes(buf)
+        raise OSError("上游重定向层数过多")
+
+
+class _SegmentedStream:
+    """N 条并行 Range 请求 → 一条按序的字节流。
+
+    顺序很关键：多连接下载的完成次序天然是乱的，而手机侧要的是一条从 start
+    到 end 的连续流，所以 worker 只管乱序取、写端严格按单元号出。中间用「预取
+    窗口」限内存：worker 抢到单元号后才去拉，且只在 (next_fetch - next_write)
+    小于窗口时才继续抢，于是内存上限 ≈ 窗口 × 单元大小。
+    """
+
+    def __init__(self, url: str, start: int, end: int, headers: dict, *,
+                 conns: int = RELAY_CONNS, unit: int = RELAY_UNIT,
+                 on_progress=None):
+        self.url, self.headers = url, headers
+        self.first, self.last = start, end      # 别叫 start/end：会撞同名方法
+        self.unit = max(64 * 1024, int(unit))
+        self.total = max(0, end - start + 1)
+        self.units = max(1, (self.total + self.unit - 1) // self.unit)
+        self.conns = max(1, min(int(conns), self.units))
+        self.window = max(2, int(self.conns * 1.25))
+        self.on_progress = on_progress
+        self._cv = threading.Condition()
+        self._buf: dict[int, bytes] = {}
+        self._next_fetch = 0        # 下一个被领取的单元号
+        self._next_write = 0        # 已被写端取走的最高单元号 + 1
+        self._err: Exception | None = None
+        self._closed = False
+        self._sent = 0
+
+    def start(self) -> "_SegmentedStream":
+        for _ in range(self.conns):
+            threading.Thread(target=self._worker, daemon=True).start()
+        return self
+
+    def _worker(self) -> None:
+        up = _Upstream(self.url, self.headers)
+        try:
+            while True:
+                with self._cv:
+                    while True:
+                        if self._closed or self._err is not None:
+                            return
+                        if self._next_fetch >= self.units:
+                            return
+                        if self._next_fetch - self._next_write >= self.window:
+                            self._cv.wait(0.5)       # 窗口满，等写端消化
+                            continue
+                        idx = self._next_fetch
+                        self._next_fetch += 1
+                        break
+                s = self.first + idx * self.unit
+                e = min(self.last, s + self.unit - 1)
+                try:
+                    data = up.get(s, e)
+                except _RangeUnsupported as ex:
+                    with self._cv:
+                        if self._err is None:
+                            self._err = ex
+                        self._cv.notify_all()
+                    return
+                except Exception as ex:
+                    with self._cv:
+                        if self._err is None:
+                            self._err = ex
+                        self._cv.notify_all()
+                    return
+                with self._cv:
+                    if self._closed:
+                        return
+                    self._buf[idx] = data
+                    self._cv.notify_all()
+        finally:
+            up.close()
+
+    def chunks(self):
+        """按顺序吐字节。任何 worker 出错都在这里抛出，让上层中断响应。"""
+        idx = 0
+        try:
+            while idx < self.units:
+                with self._cv:
+                    while idx not in self._buf:
+                        if self._err is not None:
+                            raise self._err
+                        if self._closed:
+                            return
+                        self._cv.wait(0.5)
+                    data = self._buf.pop(idx)
+                    self._next_write = idx + 1
+                    self._cv.notify_all()
+                self._sent += len(data)
+                if self.on_progress:
+                    self.on_progress(self._sent)
+                yield data
+                idx += 1
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+
 _RELAY_PAGE = """<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8">
@@ -242,9 +461,32 @@ _RELAY_PAGE = """<!doctype html>
 </style></head>
 <body>
 <h1>手机下载</h1>
-<p>点条目开始下载。大文件建议用 IDM / ADM / Aria2 打开本页，支持断点续传。
+<p>点条目开始下载。电脑端会开 {conns} 条连接并行去夸克拉，
+本页只占你手机一条连接，速度不受手机端下载器限制。
 本页只在电脑端程序运行期间有效，直链过期需回电脑重新生成。</p>
 <ul>{rows}</ul>
+<script>
+(function () {
+  var P = "{prefix}";
+  var items = [].slice.call(document.querySelectorAll("li[data-tok]"));
+  if (!items.length) return;
+  function tick() {
+    items.forEach(function (li) {
+      var tok = li.getAttribute("data-tok");
+      fetch(P + "/s/" + tok, { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || !d.active) return;
+          li.querySelector("i").textContent =
+            d.sent_h + " / " + d.size_h + "　" + d.speed_h + "/s　" +
+            d.conns + " 线程";
+        })
+        .catch(function () {});
+    });
+  }
+  setInterval(tick, 1000);
+})();
+</script>
 </body></html>
 """
 
@@ -292,7 +534,45 @@ class _RelayHandler(BaseHTTPRequestHandler):
             if item is None:
                 return self._text(404, "链接已失效：回电脑上重新生成")
             return self._proxy(item, head_only)
+        if rest.startswith("s/"):
+            return self._stats(rest[2:].split("/")[0])
         return self._text(404, "地址无效")
+
+    def _stats(self, token: str) -> None:
+        """给页面轮询的进度接口。存在的意义是「让用户看见确实在并行」——
+        速度上不去时，能立刻分清是没并行、还是并行被上游限住了。"""
+        srv = self.server
+        item = srv.registry.get(token)
+        if item is None:
+            return self._json({"error": "gone"})
+        now = time.time()
+        sent = int(item.get("sent") or 0)
+        t_last, s_last = item.get("_spd") or (now, sent)
+        dt = max(now - t_last, 0.001)
+        item["_spd"] = (now, sent)
+        inst = max(0.0, (sent - s_last) / dt)
+        self._json({
+            "name": item["name"],
+            "size": int(item.get("size") or 0),
+            "size_h": size_format(item.get("size")),
+            "sent": sent,
+            "sent_h": size_format(sent),
+            "speed": round(inst, 1),
+            "speed_h": size_format(inst),
+            "conns": int(item.get("conns") or 0),
+            "active": 1 if item.get("_active") else 0,
+        })
+
+    def _json(self, obj: dict) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self._responded = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _text(self, code: int, msg: str) -> None:
         data = f"<meta charset=utf-8><p>{html.escape(msg)}</p>".encode()
@@ -307,10 +587,13 @@ class _RelayHandler(BaseHTTPRequestHandler):
     def _index(self, head_only: bool) -> None:
         srv = self.server
         rows = "".join(
-            f'<li><a href="{srv.prefix}/d/{tok}">{html.escape(it["name"])}</a>'
+            f'<li data-tok="{tok}"><a href="{srv.prefix}/d/{tok}">'
+            f'{html.escape(it["name"])}</a>'
             f'<i>{html.escape(size_format(it["size"]))}</i></li>'
             for tok, it in srv.registry.ordered()) or "<li><i>没有可下载的文件</i></li>"
-        data = _RELAY_PAGE.replace("{rows}", rows).encode()
+        data = (_RELAY_PAGE.replace("{rows}", rows)
+                .replace("{prefix}", srv.prefix)
+                .replace("{conns}", str(srv.conns))).encode()
         self._responded = True
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -320,14 +603,143 @@ class _RelayHandler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(data)
 
+    def _upstream_headers(self) -> dict:
+        srv = self.server
+        h = {"User-Agent": srv.ua, "Accept": "*/*", "Accept-Encoding": "identity"}
+        if srv.cookie:
+            h["Cookie"] = srv.cookie
+        if srv.referer:
+            h["Referer"] = srv.referer
+        return h
+
+    def _probe(self, item: dict) -> dict:
+        """把「上游认不认 Range / 真实总长 / Content-Type」探一次并缓存。
+
+        为什么必须先探：分段并行的前提是上游对 Range 回 206。万一它无视 Range
+        直接回 200 整个文件，那每一条「并行」连接都会从 0 开始重下一遍——越并
+        越慢，而且白白烧流量。这是最坑的失败模式，必须提前排掉。
+        """
+        meta = item.get("_meta")
+        if meta:
+            return meta
+        h = self._upstream_headers()
+        h["Range"] = "bytes=0-0"
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(item["url"], headers=h), timeout=30) as r:
+                status = r.status
+                crange = r.headers.get("Content-Range") or ""
+                ctype = r.headers.get("Content-Type") or ""
+                etag = r.headers.get("ETag") or ""
+                lm = r.headers.get("Last-Modified") or ""
+                r.read(4096)          # 把那 1 字节读掉，别把连接挂在半截
+        except urllib.error.HTTPError as e:
+            raise OSError(f"HTTP {e.code} {e.reason}")
+        except Exception as e:
+            raise OSError(f"{type(e).__name__}: {e}")
+        total = 0
+        m = re.search(r"/(\d+)\s*$", crange)
+        if m:
+            total = int(m.group(1))
+        if not total:
+            total = int(item.get("size") or 0)
+        meta = {"range_ok": status == 206 and bool(crange), "total": total,
+                "ctype": ctype, "etag": etag, "lm": lm}
+        item["_meta"] = meta
+        return meta
+
     def _proxy(self, item: dict, head_only: bool) -> None:
         srv = self.server
-        up = {"User-Agent": srv.ua, "Accept": "*/*", "Accept-Encoding": "identity"}
-        if srv.cookie:
-            up["Cookie"] = srv.cookie
-        if srv.referer:
-            up["Referer"] = srv.referer
-        rng_header = self.headers.get("Range")
+        try:
+            meta = self._probe(item)
+        except Exception as e:
+            return self._text(502, f"取流失败：{e}")
+
+        total = meta["total"]
+        rng = self.headers.get("Range")
+        picked = parse_range(rng, total) if (rng and total > 0) else None
+        if rng and total > 0 and picked is None:
+            return self._text(416, "请求的范围超出文件大小")
+
+        conns = int(srv.conns or 1)
+        if total <= 0 or not meta["range_ok"]:
+            # 上游不认 Range：只能一条流顺序转发（也顺便兜住 size 未知的情况）
+            return self._serve_single(item, meta, head_only, rng)
+        # 带 Range 来的是 ADM/IDM 这类自己会开多连接的下载器，中继只补几条帮忙提速；
+        # 小文件则按体积封顶，别让建连开销盖过传输时间
+        conns = conns_for(total, conns, partial=picked is not None)
+
+        start, end = picked if picked else (0, total - 1)
+        return self._serve_segmented(item, meta, start, end, picked is not None,
+                                     conns, head_only)
+
+    def _serve_segmented(self, item: dict, meta: dict, start: int, end: int,
+                         partial: bool, conns: int, head_only: bool) -> None:
+        srv = self.server
+        total = meta["total"]
+        length = end - start + 1
+        unit = pick_unit(conns)
+        self._responded = True
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", meta["ctype"] or "application/octet-stream")
+        self.send_header("Content-Length", str(length))
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        for k, v in (("ETag", meta.get("etag")), ("Last-Modified", meta.get("lm"))):
+            if v:
+                self.send_header(k, v)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Disposition", content_disposition(item["name"]))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if head_only:
+            return
+
+        conns = srv.reserve(conns)
+        item.update({"sent": 0, "conns": conns, "_active": 1, "_t0": time.time(),
+                     "_spd": (time.time(), 0)})
+        stream = _SegmentedStream(
+            item["url"], start, end, self._upstream_headers(), conns=conns,
+            unit=unit, on_progress=lambda n: item.__setitem__("sent", n)).start()
+        sent = 0
+        t0 = time.time()
+        try:
+            for chunk in stream.chunks():
+                self.wfile.write(chunk)
+                sent += len(chunk)
+                item["sent"] = sent
+        except _RangeUnsupported:
+            # 探测说支持、真取时不支持（不同 CDN 节点策略不一致），没法补救
+            self.close_connection = True
+            srv.event(f"[red]{item['name']}：上游节点不支持分段，已中断[/]")
+            return
+        except (BrokenPipeError, ConnectionResetError):
+            el = max(time.time() - t0, 0.001)
+            srv.event(f"手机中断了下载：{item['name']}　已传 {size_format(sent)}"
+                      f"　均速 {size_format(int(sent / el))}/s")
+            return
+        except Exception as e:
+            self.close_connection = True
+            srv.event(f"[red]{item['name']}：取流中断[/] {e}")
+            return
+        finally:
+            stream.close()
+            item["_active"] = 0
+            srv.release(conns)
+        el = max(time.time() - t0, 0.001)
+        avg = int(sent / el)
+        srv.event(f"手机下载完成：{item['name']}　{size_format(sent)}　"
+                  f"{el:.1f}s　均速 {size_format(avg)}/s　{conns} 线程并行")
+
+    def _serve_single(self, item: dict, meta: dict, head_only: bool,
+                      rng_header: str | None) -> None:
+        """上游不认 Range 时的退路：老老实实一条连接顺序转发。
+
+        手机要的那段（Range）在这里靠「读满再丢」实现——慢，但至少能播、
+        能续，不会给出错误内容。
+        """
+        srv = self.server
+        up = self._upstream_headers()
         if rng_header:
             up["Range"] = rng_header
         try:
@@ -355,8 +767,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
 
         self._responded = True
         self.send_response(status)
-        ctype = resp.headers.get("Content-Type") or "application/octet-stream"
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type",
+                         meta.get("ctype") or resp.headers.get("Content-Type")
+                         or "application/octet-stream")
         for h in ("ETag", "Last-Modified"):
             if resp.headers.get(h):
                 self.send_header(h, resp.headers[h])
@@ -380,6 +793,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
         limit = int(length) if length else None
         sent = 0
         t0 = time.time()
+        item["_active"] = 1
         try:
             while limit is None or sent < limit:
                 chunk = resp.read(RELAY_CHUNK)
@@ -395,7 +809,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
             return
         finally:
             resp.close()
-        srv.event(f"手机下载完成：{item['name']}　{size_format(sent)}　{time.time() - t0:.1f}s")
+            item["_active"] = 0
+        srv.event(f"手机下载完成：{item['name']}　{size_format(sent)}　"
+                  f"{time.time() - t0:.1f}s（单连接，上游不支持分段）")
 
     @staticmethod
     def _skip(resp, n: int) -> None:
@@ -413,6 +829,22 @@ class _RelayHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
     daemon_threads = True
 
+    def handle_error(self, request, client_address) -> None:
+        """手机锁屏/切后台/取消下载都会直接掐断连接，这是常态不是故障。
+
+        默认实现会把整段 traceback 打到 stderr——而 stderr 正是 TUI 的全屏画面，
+        一打就花屏（而且用户完全没法处理这条信息）。所以这里全部吞掉，只把真正
+        的编程错误记一行到日志里。
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError, TimeoutError, OSError)):
+            return
+        try:
+            self.event(f"[red]中继异常[/] {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+
 
 class RelayServer:
     """把一批直链挂到局域网 HTTP 上，供手机下载。用完必须 stop()，
@@ -420,18 +852,43 @@ class RelayServer:
 
     def __init__(self, links: list, *, cookie: str = "", ua: str = UA,
                  referer: str = "https://pan.quark.cn/", port: int = RELAY_PORT,
-                 bind: str | None = None, on_event=None, key: str = ""):
+                 bind: str | None = None, on_event=None, key: str = "",
+                 conns: int = RELAY_CONNS):
         self.registry = RelayRegistry(links, key)
         self.prefix = "/" + self.registry.key
         self.cookie, self.ua, self.referer = cookie, ua, referer
         self.on_event = on_event
+        self.conns = max(1, int(conns))
         self._started = False
+        self._conn_lock = threading.Lock()
+        self._active_conns = 0
         self.httpd = self._bind(bind or RELAY_BIND, port)
         self.httpd.registry = self.registry
         self.httpd.prefix = self.prefix
         self.httpd.ua, self.httpd.cookie, self.httpd.referer = ua, cookie, referer
         self.httpd.event = self.event
+        self.httpd.conns = self.conns
+        self.httpd.reserve = self.reserve
+        self.httpd.release = self.release
         self.httpd.daemon_threads = True
+
+    def reserve(self, want: int) -> int:
+        """给一次下载实际分配多少条上游连接。
+
+        同时下多个文件时不能让「每个文件各 200 条」叠加起来：200×(文件数)
+        条 TCP 只会把上游风控和本机端口一起打爆。所以给总量设个上限（2 倍配置
+        值），超出时按剩余额度降级，最低仍然给 1 条保证能下。
+        """
+        cap = max(2, self.conns * 2)
+        with self._conn_lock:
+            room = max(0, cap - self._active_conns)
+            got = max(1, min(int(want), room)) if room else 1
+            self._active_conns += got
+            return got
+
+    def release(self, n: int) -> None:
+        with self._conn_lock:
+            self._active_conns = max(0, self._active_conns - int(n))
 
     @staticmethod
     def _port_busy(host: str, port: int) -> bool:
@@ -1528,6 +1985,85 @@ def selftest() -> int:
     except Exception as e:
         check("relay.e2e", False, f"{type(e).__name__}: {e}")
 
+    # 18b. 并行取流：必须证明「真的同时在拉」，而不是名义 N 线程、实际一条流。
+    #       唯一可信的证据是上游侧观测到的并发请求数——所以假上游自己记峰值。
+    try:
+        blob2 = bytes(range(256)) * 32768        # 8 MiB
+        state = {"inflight": 0, "max": 0, "reqs": 0}
+        lock = threading.Lock()
+
+        class _Up2(BaseHTTPRequestHandler):
+            def do_GET(self):
+                rng = self.headers.get("Range") or ""
+                picked = parse_range(rng, len(blob2)) or (0, len(blob2) - 1)
+                s, e = picked
+                body = blob2[s:e + 1]
+                with lock:
+                    state["inflight"] += 1
+                    state["reqs"] += 1
+                    state["max"] = max(state["max"], state["inflight"])
+                try:
+                    time.sleep(0.04)      # 拖一下，让并发窗口真的重叠
+                    self.send_response(206)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Content-Range", f"bytes {s}-{e}/{len(blob2)}")
+                    self.end_headers()
+                    self.wfile.write(body)
+                finally:
+                    with lock:
+                        state["inflight"] -= 1
+
+            def log_message(self, *a):
+                pass
+
+        up2 = ThreadingHTTPServer(("127.0.0.1", 0), _Up2)
+        threading.Thread(target=up2.serve_forever, daemon=True).start()
+        u2 = f"http://127.0.0.1:{up2.server_address[1]}/x"
+        srv3 = RelayServer([{"name": "big.bin", "size": len(blob2), "url": u2}],
+                           conns=16, port=0, bind="127.0.0.1", key="pp").start()
+        b3 = f"http://127.0.0.1:{srv3.port}/pp/"
+        tok3 = srv3.registry.ordered()[0][0]
+        with urllib.request.urlopen(b3 + "d/" + tok3, timeout=60) as r:
+            got = r.read()
+        check("relay.parallel_bytes", got == blob2, f"{len(got)} != {len(blob2)}")
+        check("relay.parallel_used", state["max"] >= 2,
+              f"上游观测到的并发峰值 = {state['max']}，请求数 {state['reqs']}")
+        # 8MiB / (16 连接 → pick_unit 给 1MiB) = 8 个单元，加 1 次探测
+        check("relay.parallel_units", state["reqs"] >= 8, str(state["reqs"]))
+        with urllib.request.urlopen(b3 + "s/" + tok3, timeout=20) as r:
+            st = json.loads(r.read())
+        check("relay.stats", st["size"] == len(blob2) and st["conns"] >= 1,
+              str(st)[:120])
+        with urllib.request.urlopen(
+                urllib.request.Request(b3 + "d/" + tok3, method="HEAD"), timeout=20) as r:
+            check("relay.head", r.status == 200
+                  and r.headers.get("Content-Length") == str(len(blob2))
+                  and r.headers.get("Accept-Ranges") == "bytes",
+                  f"{r.status} {r.headers.get('Content-Length')}")
+        # 越界 Range 必须回 416，而不是偷偷从头开始发整个文件
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                b3 + "d/" + tok3, headers={"Range": "bytes=99999999-"}), timeout=20)
+            check("relay.range_416", False, "应该 416")
+        except urllib.error.HTTPError as e:
+            check("relay.range_416", e.code == 416, str(e.code))
+        srv3.stop()
+        up2.shutdown()
+        up2.server_close()
+    except Exception as e:
+        check("relay.parallel", False, f"{type(e).__name__}: {e}")
+
+    # 18c. 单元大小随并发自适应：并行 200 条时不能按 1MiB 单元预取（那是 200MB 内存）
+    check("unit.small_conns", pick_unit(8) == 1024 * 1024, pick_unit(8))
+    check("unit.high_conns", pick_unit(200) == 256 * 1024, pick_unit(200))
+    check("unit.memory_cap", int(200 * 1.25) * pick_unit(200) <= 64 * 1024 * 1024)
+    check("config.conns_default", DEFAULT_CONFIG["conns"] == RELAY_CONNS,
+          f"{DEFAULT_CONFIG['conns']} vs {RELAY_CONNS}")
+    check("conns.big_file", conns_for(63 * 1024 ** 3, 200) == 200, conns_for(63 * 1024 ** 3, 200))
+    check("conns.tiny_file", conns_for(300 * 1024, 200) == 1, conns_for(300 * 1024, 200))
+    check("conns.mid_file", conns_for(8 * 1024 * 1024, 200) == 16, conns_for(8 * 1024 * 1024, 200))
+    check("conns.partial_smaller", conns_for(1024 ** 3, 200, partial=True) == 50)
+
     # 19. 端口被占时必须改端口，而不是「假装绑上」。Windows 上 SO_REUSEADDR 会让
     #     bind 直接成功，但连接被占用方抢走——表现出来就是服务「启动成功」却 404。
     squatter = socket.socket()
@@ -1689,11 +2225,21 @@ def build_app():
             yield Label("[b]夸克 Cookie[/]（通常用不到：按 l 扫码即可自动获取）",
                         id="s-label-cookie")
             yield TextArea(self._cfg.get("cookie", ""), id="s-cookie")
+            yield Label("[b]同时下载的并发连接数[/]（默认 200；夸克按单连接限速，"
+                        "这个数基本就是速度倍数。网络差或总被断就往下调）",
+                        id="s-label-conns")
+            yield Input(str(self._cfg.get("conns") or RELAY_CONNS), id="s-conns")
             yield Button("保存", id="s-save", variant="primary")
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             if event.button.id == "s-save":
-                cfg = {"cookie": self.query_one("#s-cookie", TextArea).text.strip()}
+                raw = self.query_one("#s-conns", Input).value.strip()
+                try:
+                    conns = max(1, min(512, int(raw or RELAY_CONNS)))
+                except ValueError:
+                    conns = RELAY_CONNS
+                cfg = {"cookie": self.query_one("#s-cookie", TextArea).text.strip(),
+                       "conns": conns}
                 self.dismiss(cfg)
 
         def action_cancel(self) -> None:
@@ -1756,6 +2302,7 @@ def build_app():
 
         def compose(self) -> ComposeResult:
             yield Label(f"[b]手机下载[/]　{self._count} 个文件就绪　"
+                        f"[b]{self._server.conns}[/] 条连接并行　"
                         "[dim]手机连同一个 Wi-Fi，扫码或输入地址　esc=停止中继[/]",
                         id="m-title")
             yield Static("", id="m-qr")
@@ -2255,8 +2802,10 @@ def build_app():
                 self.call_from_thread(self.notify, "没有拿到任何直链", severity="warning")
                 return
             links = [{"name": g["name"], "size": g["size"], "url": g["url"]} for g in got]
+            conns = int(self.config.get("conns") or RELAY_CONNS)
             try:
                 srv = RelayServer(links, cookie=self.client.cookie,
+                                  conns=conns,
                                   on_event=self._relay_event).start()
             except Exception as e:
                 self.call_from_thread(self.notify, f"中继启动失败：{e}", severity="error")
@@ -2429,6 +2978,73 @@ def probe_transfer(share_text: str) -> int:
     return 0 if ok else 1
 
 
+def speedtest(conns: int, secs: float = 12.0) -> int:
+    """量「手机到底能跑多快」：手机侧只开一条连接，中继内部换不同并发数。
+
+    为什么要跑这个：夸克按单连接限速，所以速度几乎只由中继的并发数决定。网络
+    时段（晚高峰）差别很大，别人测出来的数对你不作数，只能自己这会儿测。
+    """
+    cfg = load_config()
+    if not (cfg.get("cookie") or "").strip():
+        print("本机没有 Cookie，先扫码登录（或按 s 填 Cookie）再测。")
+        return 2
+    c = QuarkClient(cfg["cookie"])
+    try:
+        items = c.list_dir("0")
+    except Exception as e:
+        print(f"列目录失败（Cookie 大概过期了）：{e}")
+        return 2
+    files = [i for i in items if not is_folder(i)]
+    if not files:
+        print("根目录没有文件可测。")
+        return 2
+    files.sort(key=lambda i: int(i.get("size") or 0), reverse=True)
+    f = files[0]
+    g = c.get_download_links([f["fid"]])[0]
+    print(f"测试文件：{g['name']}　{size_format(g['size'])}\n")
+
+    def once(n: int) -> tuple[float, float]:
+        srv = RelayServer([{"name": g["name"], "size": g["size"], "url": g["url"]}],
+                          cookie=c.cookie, port=0, bind="127.0.0.1",
+                          key="sp", conns=n).start()
+        tok = srv.registry.ordered()[0][0]
+        url = f"http://127.0.0.1:{srv.port}/sp/d/{tok}"
+        t0 = time.time()
+        ttfb = 0.0
+        got = 0
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                while time.time() - t0 < secs:
+                    b = r.read(RELAY_CHUNK)
+                    if not b:
+                        break
+                    if not ttfb:
+                        ttfb = time.time() - t0
+                    got += len(b)
+        except Exception as e:
+            print(f"  {n} 并发测试中断：{type(e).__name__}: {e}")
+        finally:
+            srv.stop()
+        el = max(time.time() - t0, 0.001)
+        steady = max(el - ttfb, 0.001)
+        print(f"{n:>4} 并发：{got / 1048576:7.1f} MB / {el:4.1f}s"
+              f"　首字节 {ttfb:4.2f}s　稳态 {got / 1048576 / steady:5.2f} MB/s")
+        return got / 1048576 / steady, ttfb
+
+    one_, _ = once(1)
+    many, ttfb = once(max(2, conns))
+    print()
+    if one_ <= 0:
+        print("单连接没测出数据，先排查网络。")
+        return 1
+    print(f"结论：单连接 {one_:.2f} MB/s → {conns} 并发 {many:.2f} MB/s"
+          f"（{many / one_:.1f} 倍），首字节 {ttfb:.2f}s")
+    if many / one_ < 1.5:
+        print("加速不明显：如果不是晚高峰，可能是这个 CDN 节点当前就慢，"
+              "换时间再测，或检查是不是走了代理。")
+    return 0
+
+
 def main() -> None:
     # selftest / probe 只走 HTTP 层，不依赖 textual，先处理掉再要求装 TUI 依赖
     if "--selftest" in sys.argv:
@@ -2439,6 +3055,16 @@ def main() -> None:
             print("用法：python quarkbc.py --probe \"https://pan.quark.cn/s/xxxx?pwd=abcd\"")
             sys.exit(2)
         sys.exit(probe_transfer(sys.argv[i + 1]))
+    if "--speedtest" in sys.argv:
+        n = RELAY_CONNS
+        if "--conns" in sys.argv:
+            j = sys.argv.index("--conns")
+            if j + 1 < len(sys.argv):
+                try:
+                    n = max(1, min(512, int(sys.argv[j + 1])))
+                except ValueError:
+                    pass
+        sys.exit(speedtest(n))
     _lazy_import_textual()
     app_cls = build_app()
     app_cls().run()
