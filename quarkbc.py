@@ -21,16 +21,21 @@ QuarkBC TUI —— 夸克网盘 → 比特彗星 bc:// 链接生成器
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import random
 import re
+import secrets
+import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------- 常量
@@ -102,6 +107,384 @@ def size_format(n) -> str:
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024.0
     return "-"
+
+
+# ---------------------------------------------------------------- 手机下载中继
+#
+# 为什么需要它：bc:// 是比特彗星私有的任务格式，手机上没有任何 App 认。而剥掉
+# 外壳后的直链要求请求同时带「桌面 UA + Cookie」才能过夸克 CDN 的校验——手机
+# 浏览器/下载器给不出这两个头，直接打开只会 403。所以换个思路：让电脑当代理。
+#
+# 电脑上起一个只读 HTTP 中继，手机连同一 Wi-Fi 打开它 → 中继替手机补上 UA/Cookie
+# 去上游取流 → 原样吐给手机。手机侧不用装任何东西，浏览器、IDM、ADM、Aria2 都行，
+# 而且支持 Range 断点续传，大文件断了能接着下。
+
+RELAY_PORT = 8765
+RELAY_BIND = "0.0.0.0"      # 必须监听所有网卡，手机才连得进来；测试里会改回 127.0.0.1
+RELAY_CHUNK = 256 * 1024
+
+
+def relay_key(n: int = 9) -> str:
+    """URL 里那段随机路径。不是安全边界（同 Wi-Fi 的人都能访问），
+    只是避免地址被随手猜中——毕竟它等于把网盘内容临时挂到了局域网上。"""
+    return secrets.token_urlsafe(n)
+
+
+def content_disposition(name: str) -> str:
+    """中文名必须给 RFC 5987 形式，否则安卓下载器会把文件名存成 %E4%B8%AD..."""
+    fallback = re.sub(r'[^\x20-\x7e]', "_", name).replace('"', "_").replace("\\", "_")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{urllib.parse.quote(name)}"
+
+
+def parse_range(header: str, total: int) -> tuple[int, int] | None:
+    """解析 Range 头 → 闭区间 (start, end)，解析不了返回 None（按整文件处理）。
+
+    为什么自己解析：多数 CDN 节点直接认 Range，但有的会无视它照样回 200 整个文件。
+    手机播放器拖进度条就是靠 Range 实现的，不自己兜一层，视频只能从头看。
+    """
+    m = re.match(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", header or "")
+    if not m:
+        return None
+    a, b = m.group(1), m.group(2)
+    if not a and not b:
+        return None
+    if not a:                       # bytes=-500 → 最后 500 字节，需要总长才知道起点
+        if total <= 0:
+            return None
+        n = int(b)
+        if n <= 0:
+            return None
+        return (max(0, total - n), total - 1)
+    start = int(a)
+    if not b:                       # bytes=100- → 从 100 到结尾
+        if total <= 0:
+            return None
+        return (start, total - 1) if start < total else None
+    end = int(b)
+    if total > 0:
+        end = min(end, total - 1)
+    return (start, end) if start <= end else None
+
+
+def lan_ips() -> list[str]:
+    """本机可用于局域网访问的 IPv4，按「手机最可能连上」排序。
+
+    多网卡时全列出来而不是猜：装了 VPN / 虚拟网卡（Tailscale 100.x、Docker 172.x）
+    的话，默认路由那个地址未必是手机能到的那个，让用户自己挑比猜错强。
+    """
+    found: list[str] = []
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("223.5.5.5", 80))    # 不发包，只让内核选出默认出口网卡
+        found.append(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+    uniq = [ip for i, ip in enumerate(found)
+            if ip and not ip.startswith("127.") and ip not in found[:i]]
+
+    def rank(ip: str) -> int:
+        # 家用路由器/热点基本都是 192.168.x；其次是 10.x；100.x 基本是 Tailscale
+        return (0 if ip.startswith("192.168.") else
+                1 if ip.startswith("10.") else
+                2 if ip.startswith("172.") else
+                3 if ip.startswith("100.") else 4)
+
+    return sorted(uniq, key=rank) or ["127.0.0.1"]
+
+
+class RelayRegistry:
+    """token → 一条待下载条目。token 短且随机，刷新即变。"""
+
+    def __init__(self, links: list, key: str = ""):
+        self.key = key or relay_key()
+        self.items: dict[str, dict] = {}
+        for l in links:
+            self.items[relay_key(5)] = {
+                "name": l.get("name") or "download",
+                "size": int(l.get("size") or 0),
+                "url": l.get("url") or "",
+                "sent": 0,
+            }
+
+    def get(self, token: str) -> dict | None:
+        return self.items.get(token)
+
+    def ordered(self) -> list[tuple[str, dict]]:
+        return list(self.items.items())
+
+
+_RELAY_PAGE = """<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QuarkBC · 手机下载</title>
+<style>
+ :root { color-scheme: dark; }
+ body { margin:0; padding:22px 16px 48px; background:#111317; color:#e8eaed;
+        font:16px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+ h1 { font-size:19px; margin:0 0 6px; }
+ p  { color:#9aa0a6; font-size:13px; margin:0 0 16px; }
+ ul { list-style:none; padding:0; margin:0; }
+ li { background:#1c1f24; border:1px solid #2a2e35; border-radius:12px;
+      margin-bottom:10px; overflow:hidden; }
+ a  { display:block; padding:14px 16px 10px; color:#8ab4f8; text-decoration:none;
+      font-size:15px; word-break:break-all; }
+ a:active { background:#23262c; }
+ i  { display:block; padding:0 16px 12px; color:#7f858c; font-size:12px;
+      font-style:normal; }
+</style></head>
+<body>
+<h1>手机下载</h1>
+<p>点条目开始下载。大文件建议用 IDM / ADM / Aria2 打开本页，支持断点续传。
+本页只在电脑端程序运行期间有效，直链过期需回电脑重新生成。</p>
+<ul>{rows}</ul>
+</body></html>
+"""
+
+
+class _RelayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"     # 支持 keep-alive，安卓下载器会复用连接
+    server_version = "QuarkBC-Relay/1.0"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        pass    # 默认实现往 stderr 打，会把 TUI 全屏界面打花
+
+    def do_GET(self):
+        self._safe(False)
+
+    def do_HEAD(self):
+        self._safe(True)
+
+    def _safe(self, head_only: bool) -> None:
+        """任何异常都必须自己吞掉：socketserver 默认会往 stderr 打 traceback，
+        那会把 TUI 的全屏画面打花，而且用户根本没法处理。"""
+        self._responded = False
+        try:
+            self._serve(head_only)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            if not self._responded:
+                try:
+                    self._text(500, f"中继内部错误：{e}")
+                except Exception:
+                    pass
+            self.close_connection = True
+
+    def _serve(self, head_only: bool) -> None:
+        srv = self.server
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith(srv.prefix):
+            return self._text(404, "地址无效")
+        rest = path[len(srv.prefix):].lstrip("/")
+        if rest in ("", "index.html"):
+            return self._index(head_only)
+        if rest.startswith("d/"):
+            item = srv.registry.get(rest[2:].split("/")[0])
+            if item is None:
+                return self._text(404, "链接已失效：回电脑上重新生成")
+            return self._proxy(item, head_only)
+        return self._text(404, "地址无效")
+
+    def _text(self, code: int, msg: str) -> None:
+        data = f"<meta charset=utf-8><p>{html.escape(msg)}</p>".encode()
+        self._responded = True
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _index(self, head_only: bool) -> None:
+        srv = self.server
+        rows = "".join(
+            f'<li><a href="{srv.prefix}/d/{tok}">{html.escape(it["name"])}</a>'
+            f'<i>{html.escape(size_format(it["size"]))}</i></li>'
+            for tok, it in srv.registry.ordered()) or "<li><i>没有可下载的文件</i></li>"
+        data = _RELAY_PAGE.replace("{rows}", rows).encode()
+        self._responded = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
+
+    def _proxy(self, item: dict, head_only: bool) -> None:
+        srv = self.server
+        up = {"User-Agent": srv.ua, "Accept": "*/*", "Accept-Encoding": "identity"}
+        if srv.cookie:
+            up["Cookie"] = srv.cookie
+        if srv.referer:
+            up["Referer"] = srv.referer
+        rng_header = self.headers.get("Range")
+        if rng_header:
+            up["Range"] = rng_header
+        try:
+            resp = urllib.request.urlopen(
+                urllib.request.Request(item["url"], headers=up), timeout=60)
+        except urllib.error.HTTPError as e:
+            # 403=直链过期，416=范围超界，都原样告诉手机，别伪装成 200
+            return self._text(e.code, f"上游 HTTP {e.code}：{e.reason}")
+        except Exception as e:
+            return self._text(502, f"取流失败：{e}")
+
+        status = resp.status
+        length = resp.headers.get("Content-Length")
+        crange = resp.headers.get("Content-Range")
+        skip = 0
+        if status == 200 and rng_header:
+            total = int(length or 0)
+            picked = parse_range(rng_header, total)
+            if picked:
+                start, end = picked
+                skip = start
+                status = 206
+                length = str(end - start + 1)
+                crange = f"bytes {start}-{end}/{total}"
+
+        self._responded = True
+        self.send_response(status)
+        ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+        self.send_header("Content-Type", ctype)
+        for h in ("ETag", "Last-Modified"):
+            if resp.headers.get(h):
+                self.send_header(h, resp.headers[h])
+        if length:
+            self.send_header("Content-Length", length)
+        if crange:
+            self.send_header("Content-Range", crange)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Disposition", content_disposition(item["name"]))
+        if not length:
+            # HTTP/1.1 没有长度就只能靠关连接告诉对方「发完了」
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        if head_only:
+            resp.close()
+            return
+
+        if skip:
+            self._skip(resp, skip)
+        limit = int(length) if length else None
+        sent = 0
+        t0 = time.time()
+        try:
+            while limit is None or sent < limit:
+                chunk = resp.read(RELAY_CHUNK)
+                if not chunk:
+                    break
+                if limit is not None and sent + len(chunk) > limit:
+                    chunk = chunk[:limit - sent]
+                self.wfile.write(chunk)
+                sent += len(chunk)
+                item["sent"] = sent
+        except (BrokenPipeError, ConnectionResetError):
+            srv.event(f"手机中断了下载：{item['name']}（已传 {size_format(sent)}）")
+            return
+        finally:
+            resp.close()
+        srv.event(f"手机下载完成：{item['name']}　{size_format(sent)}　{time.time() - t0:.1f}s")
+
+    @staticmethod
+    def _skip(resp, n: int) -> None:
+        while n > 0:
+            chunk = resp.read(min(RELAY_CHUNK, n))
+            if not chunk:
+                return
+            n -= len(chunk)
+
+
+class _RelayHTTPServer(ThreadingHTTPServer):
+    # Windows 的 SO_REUSEADDR 允许绑一个**已被占用**的端口：绑上了，但外部连接
+    # 会被原来那个进程抢走——症状是服务显示启动成功、手机打开却是别人的 404。
+    # 所以宁可绑失败换端口，也不要这种「假成功」。
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+class RelayServer:
+    """把一批直链挂到局域网 HTTP 上，供手机下载。用完必须 stop()，
+    否则端口会一直占着（也是 TUI 里关闭弹窗时要做的事）。"""
+
+    def __init__(self, links: list, *, cookie: str = "", ua: str = UA,
+                 referer: str = "https://pan.quark.cn/", port: int = RELAY_PORT,
+                 bind: str | None = None, on_event=None, key: str = ""):
+        self.registry = RelayRegistry(links, key)
+        self.prefix = "/" + self.registry.key
+        self.cookie, self.ua, self.referer = cookie, ua, referer
+        self.on_event = on_event
+        self._started = False
+        self.httpd = self._bind(bind or RELAY_BIND, port)
+        self.httpd.registry = self.registry
+        self.httpd.prefix = self.prefix
+        self.httpd.ua, self.httpd.cookie, self.httpd.referer = ua, cookie, referer
+        self.httpd.event = self.event
+        self.httpd.daemon_threads = True
+
+    @staticmethod
+    def _port_busy(host: str, port: int) -> bool:
+        """绑之前先试着连一下：能连上说明有人占着（Windows 上单靠 bind 判断不出来）"""
+        probe = socket.socket()
+        probe.settimeout(0.25)
+        try:
+            probe.connect(("127.0.0.1" if host in ("", "0.0.0.0") else host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    @classmethod
+    def _bind(cls, bind: str, port: int):
+        last: Exception | None = None
+        for p in [port + i for i in range(10)] + [0]:
+            if p and cls._port_busy(bind, p):
+                continue
+            try:
+                return _RelayHTTPServer((bind, p), _RelayHandler)
+            except OSError as e:      # 端口被占（比如上次没退干净）就顺延
+                last = e
+        raise last if last else OSError("无法监听端口")
+
+    def event(self, msg: str) -> None:
+        if self.on_event:
+            try:
+                self.on_event(msg)
+            except Exception:
+                pass
+
+    def start(self) -> "RelayServer":
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self._started = True
+        return self
+
+    @property
+    def port(self) -> int:
+        return self.httpd.server_address[1]
+
+    def urls(self) -> list[str]:
+        return [f"http://{ip}:{self.port}{self.prefix}/" for ip in lan_ips()]
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        try:
+            self.httpd.shutdown()     # serve_forever 没在跑时调用会死等，所以先判标志
+        finally:
+            self.httpd.server_close()
 
 
 # ---------------------------------------------------------------- 分享转存（纯逻辑）
@@ -1066,6 +1449,99 @@ def selftest() -> int:
     check("share.split_to_subdir", all(s[1] == "newdir" for s in sf.saved), str(sf.saved))
     check("share.split_ok", res["ok"] == 3 and not res["failed"], str(res))
 
+    # 17. 手机中继的 Range 解析：手机播放器拖进度条全靠它
+    check("range.open", parse_range("bytes=100-", 1000) == (100, 999))
+    check("range.closed", parse_range("bytes=0-99", 1000) == (0, 99))
+    check("range.suffix", parse_range("bytes=-100", 1000) == (900, 999))
+    check("range.clamp", parse_range("bytes=900-5000", 1000) == (900, 999))
+    check("range.bad", parse_range("pages=1-2", 1000) is None)
+    check("range.out", parse_range("bytes=2000-3000", 1000) is None)
+    check("range.empty", parse_range("", 1000) is None)
+    cd = content_disposition("测试 视频.mp4")
+    check("relay.disposition",
+          "filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%E8%A7%86%E9%A2%91.mp4" in cd
+          and 'filename="__ __.mp4"' in cd, cd)
+    check("relay.lan_ip", bool(lan_ips()) and all(isinstance(x, str) for x in lan_ips()))
+
+    # 18. 手机中继端到端：本地假上游 + 真 HTTP 请求。
+    #     这是「手机真能下」的唯一实证——不靠推理，靠字节比对。
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        blob = bytes(range(256)) * 4096          # 1 MiB，内容可逐字节校验
+        seen: dict = {}
+
+        class _Up(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.update({k.lower(): v for k, v in self.headers.items()})
+                rng = self.headers.get("Range")
+                body, code, extra = blob, 200, {}
+                if rng and self.path.startswith("/honor"):
+                    s, e = parse_range(rng, len(blob))
+                    body, code = blob[s:e + 1], 206
+                    extra["Content-Range"] = f"bytes {s}-{e}/{len(blob)}"
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                for k, v in extra.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _Up)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        ubase = f"http://127.0.0.1:{up.server_address[1]}"
+        srv = RelayServer(
+            [{"name": "测试 视频[01].mp4", "size": len(blob), "url": ubase + "/honor"},
+             {"name": "dump.bin", "size": len(blob), "url": ubase + "/ignore"}],
+            cookie="c=1", port=0, bind="127.0.0.1", key="kk").start()
+        base = f"http://127.0.0.1:{srv.port}/kk/"
+        toks = [t for t, _ in srv.registry.ordered()]
+        with urllib.request.urlopen(base, timeout=20) as r:
+            page = r.read().decode()
+        check("relay.index", "测试 视频[01].mp4" in page and "/kk/d/" in page)
+        with urllib.request.urlopen(base + "d/" + toks[0], timeout=20) as r:
+            check("relay.full_1MiB", r.read() == blob)
+        # 上游补头：UA/Cookie/Referer 必须由中继补上，手机侧什么都不用带
+        check("relay.inject_headers",
+              "QuarkPC" in seen.get("user-agent", "") and seen.get("cookie") == "c=1"
+              and bool(seen.get("referer")))
+        with urllib.request.urlopen(urllib.request.Request(
+                base + "d/" + toks[0], headers={"Range": "bytes=1000-1999"}), timeout=20) as r:
+            check("relay.range_honored", r.status == 206 and r.read() == blob[1000:2000])
+        with urllib.request.urlopen(urllib.request.Request(
+                base + "d/" + toks[1], headers={"Range": "bytes=5000-5999"}), timeout=20) as r:
+            check("relay.range_selfslice", r.status == 206 and r.read() == blob[5000:6000])
+        with urllib.request.urlopen(urllib.request.Request(
+                base + "d/" + toks[0], headers={"Range": "bytes=-256"}), timeout=20) as r:
+            check("relay.range_suffix", r.read() == blob[-256:])
+        try:
+            urllib.request.urlopen(base + "d/NOPE", timeout=20)
+            check("relay.bad_token", False, "应该 404")
+        except urllib.error.HTTPError as e:
+            check("relay.bad_token", e.code == 404, str(e.code))
+        srv.stop()
+        up.shutdown()
+        up.server_close()
+        check("relay.stopped", not srv._started)
+    except Exception as e:
+        check("relay.e2e", False, f"{type(e).__name__}: {e}")
+
+    # 19. 端口被占时必须改端口，而不是「假装绑上」。Windows 上 SO_REUSEADDR 会让
+    #     bind 直接成功，但连接被占用方抢走——表现出来就是服务「启动成功」却 404。
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    squatted = squatter.getsockname()[1]
+    try:
+        srv2 = RelayServer([{"name": "x", "size": 1, "url": "http://127.0.0.1:1/"}],
+                           port=squatted, bind="127.0.0.1").start()
+        check("relay.port_skip", srv2.port != squatted, f"{squatted} -> {srv2.port}")
+        srv2.stop()
+    finally:
+        squatter.close()
+
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     return 1 if failures else 0
 
@@ -1264,6 +1740,59 @@ def build_app():
         def action_close(self) -> None:
             self.dismiss()
 
+    class MobileScreen(ModalScreen):
+        """手机下载中继的入口页：二维码 + 局域网地址 + 传输日志。
+
+        直链必须带桌面 UA 和 Cookie 才拿得到，手机给不出这两个头；所以让电脑
+        做代理转发，手机连同一 Wi-Fi 打开地址就能下，不用装任何 App。
+        """
+        BINDINGS = [("escape", "close", "停止中继")]
+
+        def __init__(self, server, urls: list, count: int):
+            super().__init__()
+            self._server = server
+            self._urls = urls or ["127.0.0.1"]
+            self._count = count
+
+        def compose(self) -> ComposeResult:
+            yield Label(f"[b]手机下载[/]　{self._count} 个文件就绪　"
+                        "[dim]手机连同一个 Wi-Fi，扫码或输入地址　esc=停止中继[/]",
+                        id="m-title")
+            yield Static("", id="m-qr")
+            yield Static("", id="m-url")
+            yield RichLog(id="m-log", markup=True, wrap=True, max_lines=120)
+            with Horizontal(id="m-btns"):
+                yield Button("复制地址", id="m-copy", variant="primary")
+                yield Button("停止中继并关闭", id="m-stop", variant="warning")
+
+        def on_mount(self) -> None:
+            # 和扫码登录同一个思路：整体 black-on-white，深浅色终端都能扫
+            self.query_one("#m-qr", Static).update(
+                Text(qr_text(self._urls[0], border=2), style="black on white"))
+            lines = [f"[b]{self._urls[0]}[/]"]
+            for u in self._urls[1:]:
+                lines.append(f"[dim]其他网卡：{u}[/]")
+            lines.append("[dim]首次运行 Windows 会弹防火墙提示，勾「专用网络」允许即可[/]")
+            self.query_one("#m-url", Static).update("\n".join(lines))
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "m-copy":
+                import pyperclip
+                pyperclip.copy(self._urls[0])
+                self.notify("地址已复制，用手机浏览器打开即可")
+            elif event.button.id == "m-stop":
+                self.action_close()
+
+        def relay_log(self, msg: str) -> None:
+            self.query_one("#m-log", RichLog).write(msg)
+
+        def action_close(self) -> None:
+            self.dismiss()
+
+        def on_unmount(self) -> None:
+            # 弹窗关掉 / 程序退出都要停服务，否则端口一直被占
+            self._server.stop()
+
     class TransferScreen(ModalScreen):
         """分享链接批量转存。
 
@@ -1384,6 +1913,12 @@ def build_app():
         #r-links { height: 1fr; width: 95%; }
         #r-btns { height: 3; }
         #r-btns Button { margin-right: 1; }
+        MobileScreen { align: center middle; }
+        #m-title { margin-bottom: 1; }
+        #m-url { margin-top: 1; }
+        #m-log { height: 8; width: 90%; border: solid $primary; margin-top: 1; }
+        #m-btns { height: 3; margin-top: 1; }
+        #m-btns Button { margin-right: 1; }
         QrLoginScreen { align: center middle; }
         #q-title { margin-bottom: 1; }
         #q-status { margin-top: 1; }
@@ -1401,6 +1936,7 @@ def build_app():
             Binding("o", "open", "进入/生成"),
             Binding("b", "gen_bc", "生成BC链接"),
             Binding("w", "wake", "唤起下载"),
+            Binding("m", "mobile", "手机下载"),
             Binding("u,backspace", "up", "上级"),
             Binding("r", "refresh", "刷新"),
             Binding("t", "transfer", "批量转存"),
@@ -1421,6 +1957,8 @@ def build_app():
             self.selected: dict[str, dict] = {}   # fid -> 列表项
             self.items: dict[str, dict] = {}      # fid -> 当前列表项（勾选判断要用原始字段）
             self.order: list[str] = []            # fid，与表格行序一致
+            self._relay = None                    # 手机下载中继（运行中时非 None）
+            self._mobile = None                   # 手机下载弹窗，用于把传输日志投进去
 
         # ---------- UI 骨架
 
@@ -1430,6 +1968,7 @@ def build_app():
             with Horizontal(id="toolbar"):
                 yield Button("生成链接(b)", id="tb-gen", variant="primary")
                 yield Button("唤起下载(w)", id="tb-wake", variant="success")
+                yield Button("手机下载(m)", id="tb-mobile")
                 yield Button("上级(u)", id="tb-up")
                 yield Button("刷新(r)", id="tb-refresh")
                 yield Button("批量转存(t)", id="tb-transfer")
@@ -1456,6 +1995,7 @@ def build_app():
             actions = {
                 "tb-gen": self.action_gen_bc,
                 "tb-wake": self.action_wake,
+                "tb-mobile": self.action_mobile,
                 "tb-up": self.action_up,
                 "tb-refresh": self.action_refresh,
                 "tb-transfer": self.action_transfer,
@@ -1685,6 +2225,72 @@ def build_app():
             self.run_worker(lambda: self._worker_links(fids, then="wake"),
                             thread=True, exclusive=True, group="links")
             self._log("[dim]获取直链中…（完成后自动唤起比特彗星）[/]")
+
+        # ---------- 手机下载（局域网 HTTP 中继）
+
+        def action_mobile(self) -> None:
+            # 和 w 一样是「一步到位」：勾选 → 取直链 → 起中继 → 弹二维码
+            if self._relay is not None:          # 已经在跑，直接回到那个弹窗
+                self._open_mobile(self._relay, len(self._relay.registry.ordered()))
+                return
+            if not self._guard():
+                return
+            fids = list(self.selected.keys())
+            if not fids:
+                self.notify("先勾选文件，再按 m 用手机下载", severity="warning")
+                return
+            self.run_worker(lambda: self._worker_mobile(fids), thread=True,
+                            exclusive=True, group="mobile")
+            self._log("[dim]准备手机下载中继…[/]")
+
+        def _worker_mobile(self, fids: list) -> None:
+            try:
+                got = self.client.get_download_links(
+                    fids, on_progress=lambda d, t: self.call_from_thread(self._progress, d, t))
+            except Exception as e:
+                self.call_from_thread(self.notify, f"获取直链失败：{e}", severity="error")
+                self.call_from_thread(self._log, f"[red]获取直链失败[/] {e}")
+                return
+            if not got:
+                self.call_from_thread(self.notify, "没有拿到任何直链", severity="warning")
+                return
+            links = [{"name": g["name"], "size": g["size"], "url": g["url"]} for g in got]
+            try:
+                srv = RelayServer(links, cookie=self.client.cookie,
+                                  on_event=self._relay_event).start()
+            except Exception as e:
+                self.call_from_thread(self.notify, f"中继启动失败：{e}", severity="error")
+                return
+            self.call_from_thread(self._open_mobile, srv, len(links))
+
+        def _open_mobile(self, srv, count: int) -> None:
+            self._relay = srv
+            if self._mobile is not None:
+                return      # 弹窗已经开着，别叠第二层
+            urls = srv.urls()
+            scr = MobileScreen(srv, urls, count)
+            self._mobile = scr
+            self.push_screen(scr, self._mobile_closed)
+            self._log(f"[green]手机下载中继已启动[/] {urls[0]}")
+
+        def _mobile_closed(self, _result=None) -> None:
+            self._mobile = None
+            self._relay = None
+            self._log("[dim]手机下载中继已停止[/]")
+
+        def _relay_event(self, msg: str) -> None:
+            """由中继的服务线程调用，必须切回 UI 线程再碰界面。"""
+            def show():
+                self._log(f"[cyan]{msg}[/]")
+                if self._mobile is not None:
+                    try:
+                        self._mobile.relay_log(msg)
+                    except Exception:
+                        pass
+            try:
+                self.call_from_thread(show)
+            except Exception:
+                pass    # 程序已在退出，日志丢了无所谓
 
         def _gen_links(self, fids: list, title: str) -> None:
             if not self._guard():

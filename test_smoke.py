@@ -2,17 +2,54 @@
 """
 无头冒烟测试：不联网、不开真终端，用 textual 的 run_test 驱动完整交互链路
   启动 → 勾选文件 → 生成 BC 链接 → 结果屏内容可回解 → 唤起比特彗星收到 bc:// 链接
+  → 手机下载中继起服务并用真 HTTP 请求验字节
 网络层不在本测试覆盖范围内（selftest 只测编码，真联网行为要实机跑）。
 """
 import asyncio
 import base64
 import sys
 import tempfile
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import quarkbc
 from quarkbc import QuarkClient, build_app
+
+
+class FakeUpstream:
+    """假夸克 CDN：中继替手机补头之后打的就是它。吐固定字节，好逐字节核对。"""
+
+    def __init__(self):
+        self.blob = bytes(range(256)) * 2048      # 512 KiB
+        blob = self.blob
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def port(self) -> int:
+        return self.httpd.server_address[1]
+
+    def url(self, name: str = "movie.mkv") -> str:
+        return f"http://127.0.0.1:{self.port}/{name}"
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 class FakeClient:
@@ -187,6 +224,38 @@ async def main() -> int:
             check("transfer.screen_closed", _screen_of(app, "TransferScreen") is None)
         else:
             check("transfer.calls", False, "转存屏未出现")
+
+        # 7f. 手机下载：m → 起局域网中继 → 用真 HTTP 请求当作「手机」验字节，
+        #     再关掉弹窗确认服务真的停了（端口不释放会占住下次启动）
+        up = FakeUpstream()
+        app.client.get_download_links = lambda fids, on_progress=None: [
+            {"fid": f, "name": "movie.mkv", "size": len(up.blob), "url": up.url()}
+            for f in fids]
+        quarkbc.RELAY_BIND = "127.0.0.1"      # 测试只走环回，别触发系统防火墙
+        await pilot.press("m")
+        ok = await wait_for(pilot, lambda: _screen_of(app, "MobileScreen") is not None)
+        check("mobile.screen_open", ok)
+        relay = app._relay
+        check("mobile.relay_running", relay is not None)
+        if relay is not None:
+            base = f"http://127.0.0.1:{relay.port}{relay.prefix}/"
+            with urllib.request.urlopen(base, timeout=15) as r:
+                page = r.read().decode()
+            check("mobile.index_page", "movie.mkv" in page and relay.prefix + "/d/" in page)
+            tok = relay.registry.ordered()[0][0]
+            with urllib.request.urlopen(base + "d/" + tok, timeout=15) as r:
+                body = r.read()
+            check("mobile.phone_can_download", body == up.blob,
+                  f"{len(body)} vs {len(up.blob)}")
+            await pilot.press("escape")
+            ok = await wait_for(pilot, lambda: _screen_of(app, "MobileScreen") is None)
+            check("mobile.screen_closed", ok)
+            try:
+                urllib.request.urlopen(base + "d/" + tok, timeout=3).read()
+                check("mobile.relay_stopped", False, "关闭弹窗后端口仍在服务")
+            except Exception:
+                check("mobile.relay_stopped", True)
+        up.stop()
 
         # 8. 扫码登录链路（网络层已替换为假实现，验证 CAS 会话 Cookie 贯通）
         poll_state = {"n": 0}
